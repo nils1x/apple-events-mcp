@@ -1,0 +1,186 @@
+/**
+ * utils/binaryValidator.ts
+ * Secure binary path validation and integrity checking
+ */
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+/**
+ * Default security configuration.
+ *
+ * Each `allowedPaths` entry is a path suffix that the candidate binary must
+ * match against either its full normalized path or its parent directory. The
+ * previous "contiguous segments anywhere in the path" matcher accepted
+ * unrelated locations such as `/etc/swift/bin/passwd`; anchoring to the tail
+ * of the resolved path is what we actually want.
+ *
+ * The defaults intentionally do NOT include a bare `bin` entry — that would
+ * pass for any `/<anywhere>/bin/<anything>` (e.g. `/usr/local/bin/curl`).
+ * Production callers must opt into the specific `bin/EventKitCLI` filename
+ * suffix via configuration (see `cliExecutor.ts`).
+ */
+const DEFAULT_CONFIG = {
+    maxFileSize: 50 * 1024 * 1024, // 50MB max
+    allowedPaths: ['dist/swift/bin', 'src/swift/bin', 'swift/bin'],
+    requireAbsolutePath: true,
+};
+/**
+ * Binary validation error
+ */
+export class BinaryValidationError extends Error {
+    constructor(message, code) {
+        super(message);
+        this.code = code;
+        this.name = 'BinaryValidationError';
+    }
+}
+/**
+ * Validates binary path for security
+ */
+export function validateBinaryPath(binaryPath, config = {}) {
+    const fullConfig = { ...DEFAULT_CONFIG, ...config };
+    if (fullConfig.requireAbsolutePath && !path.isAbsolute(binaryPath)) {
+        throw new BinaryValidationError('Binary path must be absolute', 'INVALID_PATH');
+    }
+    const normalizedPath = path.normalize(binaryPath);
+    // `path.normalize` resolves any embedded `..`, so a surviving `..` segment
+    // would only come from a deliberately malformed input — check segments
+    // rather than substring (`..foo` is a legal filename).
+    const segments = normalizedPath.split(path.sep);
+    if (segments.includes('..')) {
+        throw new BinaryValidationError('Path traversal detected in binary path', 'PATH_TRAVERSAL');
+    }
+    // An entry matches when it is a suffix of either the full binary path
+    // (including its filename, e.g. `bin/EventKitCLI`) or the binary's parent
+    // directory (e.g. `dist/swift/bin`). Suffix matching is segment-aligned —
+    // `endsWith('/bin')` after stripping trailing separators avoids the
+    // `foo-bin` partial-match trap while still working for absolute and
+    // relative allowed paths.
+    const parentDir = path.dirname(normalizedPath);
+    const isInAllowedPath = fullConfig.allowedPaths.some((allowedPath) => {
+        const allowedNormalized = path
+            .normalize(allowedPath)
+            .replace(/[\\/]+$/, '');
+        if (!allowedNormalized)
+            return false;
+        const sepSuffix = path.sep + allowedNormalized;
+        return (normalizedPath === allowedNormalized ||
+            normalizedPath.endsWith(sepSuffix) ||
+            parentDir === allowedNormalized ||
+            parentDir.endsWith(sepSuffix));
+    });
+    if (!isInAllowedPath) {
+        throw new BinaryValidationError('Binary path not in allowed directories', 'FORBIDDEN_PATH');
+    }
+    if (!fs.existsSync(normalizedPath)) {
+        throw new BinaryValidationError(`Binary file not found: ${normalizedPath}`, 'FILE_NOT_FOUND');
+    }
+    const stats = fs.statSync(normalizedPath);
+    if (!stats.isFile()) {
+        throw new BinaryValidationError('Binary path does not point to a file', 'NOT_A_FILE');
+    }
+    if (stats.size > fullConfig.maxFileSize) {
+        throw new BinaryValidationError(`Binary file too large: ${stats.size} bytes`, 'FILE_TOO_LARGE');
+    }
+    try {
+        fs.accessSync(normalizedPath, fs.constants.X_OK);
+    }
+    catch (_error) {
+        throw new BinaryValidationError('Binary file is not executable', 'NOT_EXECUTABLE');
+    }
+}
+/**
+ * Calculates SHA256 hash of binary file
+ */
+export function calculateBinaryHash(binaryPath) {
+    try {
+        const fileBuffer = fs.readFileSync(binaryPath);
+        return crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    }
+    catch (error) {
+        throw new BinaryValidationError(`Failed to calculate binary hash: ${error.message}`, 'HASH_CALCULATION_FAILED');
+    }
+}
+/**
+ * Validates binary integrity using hash
+ */
+export function validateBinaryIntegrity(binaryPath, expectedHash) {
+    try {
+        const actualHash = calculateBinaryHash(binaryPath);
+        const isValid = actualHash === expectedHash;
+        return isValid;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Comprehensive binary security validation
+ */
+export function validateBinarySecurity(binaryPath, config = {}) {
+    const errors = [];
+    let hash;
+    try {
+        // Path validation
+        validateBinaryPath(binaryPath, config);
+        // Calculate hash
+        hash = calculateBinaryHash(binaryPath);
+        // Integrity check if expected hash provided
+        if (config.expectedHash) {
+            const integrityValid = validateBinaryIntegrity(binaryPath, config.expectedHash);
+            if (!integrityValid) {
+                errors.push('Binary integrity check failed - hash mismatch');
+            }
+        }
+    }
+    catch (error) {
+        if (error instanceof BinaryValidationError) {
+            errors.push(`${error.code}: ${error.message}`);
+        }
+        else {
+            errors.push(`Unexpected validation error: ${error.message}`);
+        }
+    }
+    return {
+        isValid: errors.length === 0,
+        hash,
+        errors,
+    };
+}
+/**
+ * Secure binary path finder with validation
+ */
+export function findSecureBinaryPath(possiblePaths, config = {}) {
+    for (const binaryPath of possiblePaths) {
+        const validationResult = validateBinarySecurity(binaryPath, config);
+        if (validationResult.isValid) {
+            return { path: binaryPath, validationResult };
+        }
+    }
+    return { path: null };
+}
+/**
+ * Environment-specific binary validation
+ */
+export function getEnvironmentBinaryConfig() {
+    if (process.env.NODE_ENV === 'test') {
+        // Relaxed validation for testing
+        return {
+            requireAbsolutePath: false,
+            maxFileSize: 100 * 1024 * 1024, // 100MB for test
+        };
+    }
+    if (process.env.NODE_ENV === 'development') {
+        // Development mode - log more details
+        return {
+            maxFileSize: 100 * 1024 * 1024, // 100MB for dev
+        };
+    }
+    // Production mode - strict validation
+    return {
+        expectedHash: process.env.SWIFT_BINARY_HASH,
+        maxFileSize: 50 * 1024 * 1024, // 50MB
+        requireAbsolutePath: true,
+    };
+}
+//# sourceMappingURL=binaryValidator.js.map
