@@ -1,0 +1,7 @@
+{
+  "name": "mcp-server-apple-events",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "MCP server exposing macOS Reminders and Calendar via EventKit",
+  "main": "dist/index.js"
+}

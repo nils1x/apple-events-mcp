@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { startHttpServer, startServer } from './server/server.js';
 import { findProjectRoot } from './utils/projectUtils.js';
 // Find project root and load package.json
-const projectRoot = findProjectRoot();
+const projectRoot = process.env.PROJECT_ROOT || findProjectRoot();
 let packageJson;
 try {
     packageJson = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf-8'));
